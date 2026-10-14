@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Smart C Code Analyser and Optimiser</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>Smart C Code Analyser &amp; Optimiser</h1>
+    <p class="subtitle">Lexer &rarr; Parser &rarr; Semantic Analysis &rarr; IR &rarr; Optimiser &rarr; Optimised C</p>
+  </header>
+
+  <main>
+    <section class="input-pane">
+      <div class="input-toolbar">
+        <label class="file-btn">
+          Upload .c file
+          <input type="file" id="file-input" accept=".c">
+        </label>
+        <button id="sample-btn" type="button">Load sample</button>
+        <button id="analyze-btn" type="button" class="primary">Analyse &amp; Optimise</button>
+      </div>
+      <textarea id="source" spellcheck="false">{{ sample }}</textarea>
+    </section>
+
+    <section class="output-pane">
+      <div id="status" class="status"></div>
+      <div id="results"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
