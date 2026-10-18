@@ -184,6 +184,60 @@ class _Expr:
         return self.text if self.prec >= min_prec else f"({self.text})"
 
 
+_COMPOUND_ASSIGNABLE_OPS = ("+", "-", "*", "/", "%")
+
+
+def _compound_or_increment(target: str, extra: str, a: str, b: str) -> Optional[str]:
+    """`target = target <extra> b;` (or, for the two commutative
+    operators `+`/`*`, `target = a <extra> target;`) is exactly
+    `target <extra>= b;` (respectively `a`) in C -- and adding/
+    subtracting the literal `1` this way is `target++`/`target--`.
+    Returns that equivalent statement text (with its trailing `;`), or
+    None if this isn't one of those shapes.
+
+    `a` and `b` must be the *immediate*, already fully-rendered operand
+    texts of the single BIN instruction that directly produced this
+    value (see the two call sites: either the current instruction IS
+    that BIN, or it is one single-use temporary away from it, tracked
+    through `pending_bin`) -- never a flattened string that might
+    itself be the result of further chained same-precedence operators.
+    Checking `a == target` / `b == target` as whole-string equality
+    (not a prefix/suffix regex on a merged expression) is what makes
+    this sound: `arr[idx] = (arr[idx] % 31) * (b % 31) % 100` must NOT
+    become `arr[idx] %= 31 * (b % 31) % 100` (wrong -- modulo/
+    multiplication chain left-associates, so the outermost operation
+    here is the trailing `% 100`, not a `%` with `arr[idx]` as a direct
+    operand), and comparing whole strings correctly rejects it, since
+    the outer BIN's own immediate operands are the *whole* inner
+    product expression and `100` -- neither of which equals `arr[idx]`
+    -- rather than merely starting with that text.
+
+    This never double-evaluates anything the plain form did not: this
+    IR always computes a side-effecting sub-expression (a call, an
+    increment) into its own temporary before it is ever used as an
+    operand, so an operand reaching here is always a plain
+    already-evaluated name/constant/memory read."""
+    if extra not in _COMPOUND_ASSIGNABLE_OPS:
+        return None
+    if a == target:
+        other = b
+    elif extra in ("+", "*") and b == target:
+        other = a
+    else:
+        return None
+    # `*p++;` means `*(p++)` in C -- postfix `++`/`--` bind tighter than
+    # a prefix dereference, so the shorthand is only safe for a target
+    # with no leading `*` (a plain name, or one ending in `[...]` /
+    # `.member` / `->member`, all of which bind at the same tight
+    # postfix precedence as `++`/`--` itself and so group correctly:
+    # `arr[i]++` really is `(arr[i])++`). `+=`/`-=` have no such hazard
+    # -- assignment binds looser than every unary and postfix operator,
+    # so `*p += 1;` is always `(*p) += 1;`.
+    if other == "1" and extra in ("+", "-") and not target.startswith("*"):
+        return f"{target}{'++' if extra == '+' else '--'};"
+    return f"{target} {extra}= {other};"
+
+
 def _struct_field_types(program: Optional[Program]) -> Dict[str, Dict[str, str]]:
     """struct/union tag -> {field name -> declared C type}, used to infer
     the type of a compiler temporary loaded from a member access (`s.f`,
@@ -289,6 +343,15 @@ def emit_function(fn: IRFunction, ctx: "OptContext", struct_types: Dict[str, Dic
     declared_temps = set()
 
     pending: Dict[str, _Expr] = {}       # temp -> expression text
+    # for a pending temp defined by exactly one BIN: (op, a, b), the
+    # *immediate* already-rendered operand texts of that one BIN -- see
+    # `_compound_or_increment`. Kept in lockstep with `pending`: popped
+    # wherever a pending entry is popped or force-materialised, so a
+    # temp that got merged into a larger expression (no longer standing
+    # for just that one BIN) or flushed to its own statement (no longer
+    # standing for a live, reassignable "target" at all) never leaves a
+    # stale entry a later statement could wrongly match against.
+    pending_bin: Dict[str, Tuple[str, str, str]] = {}
     # pending temps whose expression reads memory (`*p`, `a[i]`, `p->f`, ...).
     # Any write to a named variable can change such a read through an alias
     # (`int *p = &b; ... b = 2;`), so these are materialised before one.
@@ -311,6 +374,7 @@ def emit_function(fn: IRFunction, ctx: "OptContext", struct_types: Dict[str, Dic
         if s in pending:
             e = pending.pop(s)
             pending_deps.pop(s, None)
+            pending_bin.pop(s, None)
             if s in reads_memory:
                 reads_memory.discard(s)
                 consumed_memory[0] = True
@@ -348,6 +412,7 @@ def emit_function(fn: IRFunction, ctx: "OptContext", struct_types: Dict[str, Dic
                   if base in deps or (aliasable and t in reads_memory)]:
             e = pending.pop(t)
             pending_deps.pop(t)
+            pending_bin.pop(t, None)
             reads_memory.discard(t)
             add(f"{_infer_type(ctx, struct_types, t)} {t} = {e.text};", decl=t)
 
@@ -361,6 +426,7 @@ def emit_function(fn: IRFunction, ctx: "OptContext", struct_types: Dict[str, Dic
         for t in list(pending):
             e = pending.pop(t)
             pending_deps.pop(t, None)
+            pending_bin.pop(t, None)
             reads_memory.discard(t)
             add(f"{_infer_type(ctx, struct_types, t)} {t} = {e.text};", decl=t)
 
@@ -395,12 +461,18 @@ def emit_function(fn: IRFunction, ctx: "OptContext", struct_types: Dict[str, Dic
                     open_decl[0] = (len(lines) - 1, ins.extra, _name(ins.dest))
         elif op in ("BIN", "UN", "ASSIGN", "CALL", "CAST"):
             consumed_memory[0] = False
+            # (extra, a, b): the *immediate* operand texts of the single
+            # BIN this value reduces to (itself, or one single-use temp
+            # away from it, via `pending_bin`) -- see
+            # `_compound_or_increment`. None for every other shape.
+            compound_src: Optional[Tuple[str, str, str]] = None
             if op == "BIN":
                 prec = PREC.get(ins.extra, 1)
                 left_min = prec + 1 if ins.extra in COMPARISON_PREC else prec
                 a = render(ins.arg1).wrap(left_min)
                 b = render(ins.arg2).wrap(prec + 1)
                 rhs = _Expr(f"{a} {ins.extra} {b}", prec)
+                compound_src = (ins.extra, a, b)
             elif op == "UN":
                 a = render(ins.arg1).wrap(ATOM)
                 rhs = _Expr(f"{ins.extra}{a}", 7)
@@ -408,6 +480,8 @@ def emit_function(fn: IRFunction, ctx: "OptContext", struct_types: Dict[str, Dic
                 a = render(ins.arg1).wrap(ATOM)
                 rhs = _Expr(f"({ins.extra}){a}", 7)
             elif op == "ASSIGN":
+                if isinstance(ins.arg1, str):
+                    compound_src = pending_bin.get(ins.arg1)
                 rhs = render(ins.arg1)
             else:
                 args = ", ".join(render(a).text for a in (ins.arg1 or []))
@@ -436,6 +510,8 @@ def emit_function(fn: IRFunction, ctx: "OptContext", struct_types: Dict[str, Dic
                 if single_use and (op != "CALL" or next_uses):
                     pending[dest] = rhs
                     pending_deps[dest] = deps_of(ins.arg1, ins.arg2)
+                    if compound_src is not None:
+                        pending_bin[dest] = compound_src
                     operands = [ins.arg1, ins.arg2] if op != "CALL" else list(ins.arg1 or [])
                     if (consumed_memory[0] or (op == "UN" and ins.extra == "*")
                             or any(_touches_memory(o) for o in operands)):
@@ -458,7 +534,10 @@ def emit_function(fn: IRFunction, ctx: "OptContext", struct_types: Dict[str, Dic
                 # member, may alias anything -- flush everything
                 # pending first, same reasoning as a CALL.
                 flush_all()
-                add(f"{render(dest).text} = {rhs.text};", expr=True)
+                tgt = render(dest).text
+                compound = (_compound_or_increment(tgt, *compound_src)
+                           if compound_src is not None else None)
+                add(compound or f"{tgt} = {rhs.text};", expr=True)
             elif dest:
                 flush_dependents(dest)
                 target = render(dest).text
@@ -468,7 +547,9 @@ def emit_function(fn: IRFunction, ctx: "OptContext", struct_types: Dict[str, Dic
                     lines[od[0]].text = f"{od[1]} {target} = {rhs.text};"
                     open_decl[0] = None
                 else:
-                    add(f"{target} = {rhs.text};", expr=True)
+                    compound = (_compound_or_increment(target, *compound_src)
+                               if compound_src is not None else None)
+                    add(compound or f"{target} = {rhs.text};", expr=True)
             else:
                 add(f"{rhs.text};", expr=True)
     flush_all()

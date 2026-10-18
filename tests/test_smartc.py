@@ -376,7 +376,7 @@ class Optimiser(unittest.TestCase):
         )
         c = self.c_section(out)
         self.assertNotIn("dead", c)
-        self.assertIn("sum = sum + i;", c)
+        self.assertIn("sum += i;", c)
 
     # -- algebraic simplification identities ------------------------------
     def test_algebraic_identities(self):
@@ -1263,7 +1263,7 @@ class StructuredControlFlow(unittest.TestCase):
         res, orig, opt = run_both(self, program_text("loops_structured.c"))
         self.assertEqual(orig, opt)
         c = res["optimised_c"]
-        self.assertIn("for (int i = 1; i <= n; i = i + 1) {", c)
+        self.assertIn("for (int i = 1; i <= n; i++) {", c)
         self.assertIn("while (n > 0) {", c)
         self.assertIn("while (1) {", c)               # the explicit `while (1)`
         self.assertIn("break;", c)
@@ -1299,7 +1299,7 @@ class StructuredControlFlow(unittest.TestCase):
         res, orig, opt = run_both(self, program_text("loops_arrays_pointers.c"))
         self.assertEqual(orig, opt)
         c = res["optimised_c"]
-        self.assertIn("for (int i = 0; i < n; i = i + 1) {", c)
+        self.assertIn("for (int i = 0; i < n; i++) {", c)
         self.assertIn("a[i] = i * i;", c)
         self.assertIn("while (p != end) {", c)
         self.assertNotIn("goto", c)
@@ -1857,6 +1857,112 @@ class RedundantCalculationElimination(unittest.TestCase):
         res, orig, opt = run_both(self, src)
         self.assertEqual(orig, opt)
         self.assertEqual(res["optimised_c"].count("tick(10)"), 2)
+
+
+class CompoundAssignmentEmission(unittest.TestCase):
+    """`x = x op y;` is re-spelled as `x op= y;` (and `x = x +/- 1;` as
+    `x++`/`x--`) wherever the emitter can *prove* -- from the IR's own
+    instruction structure, never by pattern-matching the flattened text
+    -- that `x` is a direct operand of the single binary operation
+    that produced the value, per `_compound_or_increment` in
+    emitter.py. The proof is what makes this safe for a chain of
+    same-precedence operators: `a = (a % 31) * (b % 31) % 100` must
+    NOT become `a %= 31 * (b % 31) % 100` (wrong -- modulo/
+    multiplication left-associate, so the outermost operation is the
+    trailing `% 100`, with immediate operands `(a % 31) * (b % 31)`
+    and `100`, neither of which is `a`), a real bug this suite caught
+    with the random differential fuzzer before this class existed."""
+
+    def test_increment_in_a_for_loop_header(self):
+        src = ('#include <stdio.h>\nint main() {\n'
+               ' int sum = 0;\n'
+               ' for (int i = 0; i < 5; i = i + 1) { sum = sum + i; }\n'
+               ' printf("%d\\n", sum); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "10")
+        c = res["optimised_c"]
+        self.assertIn("i++", c)
+        self.assertIn("sum += i;", c)
+        self.assertNotIn("i = i + 1", c)
+        self.assertNotIn("sum = sum + i", c)
+
+    def test_decrement_and_array_element_compound_assignment(self):
+        src = ('#include <stdio.h>\n'
+               'int dec(int n) {\n'
+               '    int arr[3] = {10, 20, 30};\n'
+               '    arr[0] = arr[0] - 1;\n'
+               '    n = n - 1;\n'
+               '    return arr[0] + n;\n'
+               '}\n'
+               'int main() { printf("%d\\n", dec(3)); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "11")
+        c = res["optimised_c"]
+        self.assertIn("n--;", c)
+        self.assertIn("arr[0]--;", c)
+
+    def test_dereferenced_target_uses_compound_form_not_postfix(self):
+        # `*p++;` means `*(p++)` in C -- postfix `++` binds tighter than
+        # a prefix dereference, so the only safe re-spelling of
+        # `*p = *p + 1;` is `*p += 1;`, never the bare `++`/`--` form.
+        src = ('#include <stdio.h>\nint main() {\n'
+               ' int x = 5; int *p = &x;\n'
+               ' *p = *p + 1;\n'
+               ' printf("%d\\n", x); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "6")
+        c = res["optimised_c"]
+        self.assertIn("*p += 1;", c)
+        self.assertNotIn("*p++", c)
+        self.assertNotIn("++*p", c)
+
+    def test_commutative_operand_order_is_also_recognised(self):
+        src = ('#include <stdio.h>\nint main() {\n'
+               ' int total = 0;\n'
+               ' for (int i = 1; i <= 4; i = i + 1) { total = i + total; }\n'
+               ' printf("%d\\n", total); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "10")
+        self.assertIn("total += i;", res["optimised_c"])
+
+    def test_chained_same_precedence_operators_are_not_misread_as_compound(self):
+        # regression guard for the exact bug this feature first shipped
+        # with: `a` is the LEFT operand of the FIRST `%` in the chain,
+        # but that `%` is not the outermost operation (modulo and
+        # multiplication share precedence and left-associate, so the
+        # true outermost op is the trailing `% 100`) -- rewriting this
+        # as `a %= 31 * (b % 31) % 100;` would silently compute a
+        # completely different value.
+        src = ('#include <stdio.h>\nint main() {\n'
+               ' int a = 40; int b = 5;\n'
+               ' a = (a % 31) * (b % 31) % 100;\n'
+               ' printf("%d\\n", a); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        c = res["optimised_c"]
+        self.assertNotIn("a %=", c)
+        self.assertNotIn("a++", c)
+
+    def test_non_commutative_operator_only_matches_on_the_left(self):
+        # `n - x` is not `x - n` -- a target appearing only as the
+        # *right* operand of `-`/`/`/`%` must never be rewritten.
+        src = ('#include <stdio.h>\n'
+               'int f(int n, int x) {\n'
+               '    x = n - x;\n'
+               '    return x;\n'
+               '}\n'
+               'int main() { printf("%d\\n", f(10, 2)); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "8")
+        c = res["optimised_c"]
+        self.assertNotIn("x -=", c)
+        self.assertNotIn("x--", c)
+        self.assertIn("x = n - x;", c)
 
 
 class ChainedComparisonEmission(unittest.TestCase):
