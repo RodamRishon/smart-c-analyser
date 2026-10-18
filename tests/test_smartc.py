@@ -1701,6 +1701,82 @@ class PointerArraySimplification(unittest.TestCase):
         self.assertEqual(orig, opt)
         self.assertEqual(orig[0].strip(), "99")
 
+    def test_pointer_is_not_resolved_once_it_is_advanced_with_increment(self):
+        # `ptr++` lowers to a BIN with `ptr` itself as dest, not a
+        # separate ASSIGN -- regression guard for a bug where the
+        # pointer/array alias detector's "assigned exactly once" check
+        # only counted ASSIGN instructions and so missed this kind of
+        # reassignment entirely, wrongly treating `ptr` as still
+        # `&arr[0]` for the whole function and silently reading element
+        # 0 twice instead of elements 0 and 1.
+        src = ('#include <stdio.h>\nint main() {\n'
+               ' int arr[3] = {1, 2, 3}; int *ptr = arr;\n'
+               ' int first = *ptr; ptr++; int second = *ptr;\n'
+               ' printf("%d %d\\n", first, second); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "1 2")
+
+    def test_malloced_pointer_indexed_elsewhere_resolves_its_own_dereference(self):
+        # `arr` is not an alias of a *different* declared array -- it IS
+        # the array (a block `malloc`'d and then used with `arr[i]`
+        # throughout), so a bare `*arr` is just `arr[0]`: the same
+        # standards-based identity `_pointer_array_aliases` already uses,
+        # just with the pointer standing in for its own base.
+        src = ('#include <stdio.h>\n#include <stdlib.h>\nint main() {\n'
+               ' int *arr = malloc(3 * sizeof(int));\n'
+               ' arr[0] = 10; arr[1] = 20; arr[2] = 30;\n'
+               ' int first = *arr; int second = *arr;\n'
+               ' printf("%d %d\\n", first, second); free(arr); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "10 10")
+        c = res["optimised_c"]
+        self.assertIn("arr[0]", c)
+        self.assertNotIn("*arr", c)
+
+    def test_indexed_array_write_is_not_reported_as_a_rewrite(self):
+        # `arr[0] = 10;` is already array indexing -- resolving the
+        # self-alias must not rewrite it (there is nothing to rewrite)
+        # or report a pointer-simplification event for a line that was
+        # never actually changed.
+        src = ('#include <stdio.h>\n#include <stdlib.h>\nint main() {\n'
+               ' int *arr = malloc(3 * sizeof(int));\n'
+               ' arr[0] = 10; arr[1] = 20; arr[2] = 30;\n'
+               ' printf("%d\\n", arr[0] + arr[1] + arr[2]); free(arr); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "60")
+        self.assertEqual(res["optimisation_stats"]["pointer_simplifications"], 0)
+
+    def test_malloced_pointer_is_not_resolved_once_its_address_is_taken(self):
+        src = ('#include <stdio.h>\n#include <stdlib.h>\nint main() {\n'
+               ' int *arr = malloc(3 * sizeof(int));\n'
+               ' arr[0] = 1; arr[1] = 2; arr[2] = 3;\n'
+               ' int other[3] = {7, 8, 9};\n'
+               ' int **pp = &arr;\n'
+               ' int first = *arr;\n'
+               ' *pp = other;\n'
+               ' int second = *arr;\n'
+               ' printf("%d %d\\n", first, second); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "1 7")
+
+    def test_malloced_pointer_dereference_is_not_reused_across_a_call_through_it(self):
+        src = ('#include <stdio.h>\n#include <stdlib.h>\n'
+               'void mutate(int *p) { p[0] = 999; }\n'
+               'int main() {\n'
+               ' int *arr = malloc(3 * sizeof(int));\n'
+               ' arr[0] = 1; arr[1] = 2; arr[2] = 3;\n'
+               ' int first = *arr;\n'
+               ' mutate(arr);\n'
+               ' int second = *arr;\n'
+               ' printf("%d %d\\n", first, second); free(arr); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "1 999")
+
 
 class RedundantCalculationElimination(unittest.TestCase):
     """A second loop (or a second call to a provably pure function) that

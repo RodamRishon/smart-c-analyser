@@ -1460,11 +1460,14 @@ def _resolve_pointer_alias_text(s: str, aliases: Dict[str, str]) -> Tuple[str, O
     a *bare* use of the pointer's own value (passed to a function,
     compared, ...) is deliberately left alone, since that is the same
     address either way but not textually the same expression (and
-    `sizeof(ptr)` must never become `sizeof(arr)`)."""
+    `sizeof(ptr)` must never become `sizeof(arr)`). A self-aliased
+    pointer (`aliases[p] == p`, from `_self_indexed_pointers`) already
+    spells its own indexed uses as `p[i]`, so that case must produce
+    nothing to report -- only its *bare* dereference (`*p`) is new text."""
     if s.startswith("*") and s[1:] in aliases:
         return f"{aliases[s[1:]]}[0]", s[1:]
     split = _split_indexed(s)
-    if split and split[0] in aliases:
+    if split and split[0] in aliases and aliases[split[0]] != split[0]:
         name, idx = split
         return aliases[name] + "".join(f"[{i}]" for i in idx), name
     return s, None
@@ -1485,20 +1488,52 @@ def _resolve_pointer_alias_operand(op, aliases: Dict[str, str]):
     return new_s, used
 
 
+def _self_indexed_pointers(instrs: List[Instr], ctx: "OptContext") -> Set[str]:
+    """Local pointers assigned exactly once in the whole function (any
+    single defining instruction -- most commonly straight from
+    `malloc`/`calloc`, or a cast of one), never reassigned afterwards
+    and never escaped, that the program itself already indexes
+    somewhere (`p[i]`, read or write): such a pointer is the base of an
+    array it owns for the rest of the function, by exactly the same
+    proof `_pointer_array_aliases` already uses for a pointer that
+    aliases a *declared* array -- just with the pointer standing in
+    for its own base instead of someone else's name. A bare `*p`
+    elsewhere is then exactly `p[0]`."""
+    def_counts: Dict[str, int] = {}
+    indexed: Set[str] = set()
+    for ins in instrs:
+        dest, _ = _def_use_raw(ins)
+        if isinstance(dest, str):
+            def_counts[dest] = def_counts.get(dest, 0) + 1
+        for operand in (ins.dest, ins.arg1, ins.arg2):
+            for v in (operand if isinstance(operand, list) else [operand]):
+                split = _split_indexed(v) if isinstance(v, str) else None
+                if split:
+                    indexed.add(split[0])
+    return {name for name, t in ctx.vars.items()
+            if _is_ptr(t) and name not in ctx.escaped and name not in ctx.param_types
+            and def_counts.get(name, 0) == 1 and name in indexed}
+
+
 def resolve_pointer_array_aliases(instrs: List[Instr], ctx: "OptContext",
                                   events: Optional[List[OptEvent]] = None
                                   ) -> Tuple[List[Instr], int]:
     """A pointer proven to always hold `&array[0]` (assigned exactly once
     in the whole function, straight from the array's name, never
-    reassigned and never escaped -- see `_pointer_array_aliases`) is read
-    through for the rest of the function: `*ptr` and `ptr[i]` name
-    exactly the memory `arr[0]` and `arr[i]` already do, so reading or
-    writing through the pointer is rewritten to read or write the array
-    directly. This leaves the pointer's own declaration and assignment
-    with no remaining use, which dead-code/unused-declaration cleanup
-    then removes on its own."""
+    reassigned and never escaped -- see `_pointer_array_aliases`), or
+    proven to be the base of its own array because the program already
+    indexes it elsewhere (see `_self_indexed_pointers`), is read through
+    for the rest of the function: `*ptr` and `ptr[i]` name exactly the
+    memory `arr[0]` and `arr[i]` already do, so reading or writing
+    through the pointer is rewritten to read or write the array
+    directly. In the first case this leaves the pointer's own
+    declaration and assignment with no remaining use, which dead-code/
+    unused-declaration cleanup then removes on its own; in the second
+    the pointer is still needed for its own indexing and stays."""
     events = events if events is not None else []
-    aliases = _pointer_array_aliases(instrs, ctx)
+    aliases = dict(_pointer_array_aliases(instrs, ctx))
+    for name in _self_indexed_pointers(instrs, ctx):
+        aliases.setdefault(name, name)
     if not aliases:
         return instrs, 0
     out: List[Instr] = []
@@ -1519,9 +1554,13 @@ def resolve_pointer_array_aliases(instrs: List[Instr], ctx: "OptContext",
             out.append(ins)
             continue
         count += 1
-        events.append(OptEvent(ins.line, "pointer",
-            f"'{_display(used)}' always points at '{_display(aliases[used])}[0]' (assigned once, "
-            f"never reassigned); read/write through it rewritten as array indexing"))
+        target = aliases[used]
+        msg = (f"'{_display(used)}' is the base of an array it owns (already indexed "
+               f"elsewhere, assigned once, never reassigned); the dereference is read "
+               f"directly as '{_display(used)}[0]'" if target == used else
+               f"'{_display(used)}' always points at '{_display(target)}[0]' (assigned once, "
+               f"never reassigned); read/write through it rewritten as array indexing")
+        events.append(OptEvent(ins.line, "pointer", msg))
         out.append(Instr(op, dest=new_dest, arg1=new_arg1, arg2=new_arg2,
                          extra=None if op == "ASSIGN" else ins.extra, line=ins.line))
     return out, count
@@ -1661,9 +1700,20 @@ def _pointer_array_aliases(instrs: List[Instr], ctx: "OptContext") -> Dict[str, 
     function, straight from a declared array's name (`int *p = arr;`,
     the array decaying to a pointer to its first element) -- `p` and
     `arr` then always name the same memory for the rest of the
-    function, so `p[i]` and `arr[i]` are the same read/write."""
+    function, so `p[i]` and `arr[i]` are the same read/write.
+
+    "Assigned exactly once" has to count every instruction form that
+    can define a plain name, not only ASSIGN: `p++` / `p += 1` lower
+    to a BIN with `p` itself as `dest` (no separate ASSIGN at all --
+    unlike `p = p + 1`, which still goes through one), so a def count
+    that only looked at ASSIGN would miss that `p` moves and wrongly
+    treat every later `*p` as still `&arr[0]`."""
     assigns: Dict[str, List] = {}
+    def_counts: Dict[str, int] = {}
     for ins in instrs:
+        dest, _ = _def_use_raw(ins)
+        if isinstance(dest, str):
+            def_counts[dest] = def_counts.get(dest, 0) + 1
         if ins.op == "ASSIGN" and isinstance(ins.dest, str):
             assigns.setdefault(ins.dest, []).append(ins.arg1)
     aliases: Dict[str, str] = {}
@@ -1671,7 +1721,8 @@ def _pointer_array_aliases(instrs: List[Instr], ctx: "OptContext") -> Dict[str, 
         if not _is_ptr(t) or name in ctx.escaped or name in ctx.param_types:
             continue
         srcs = assigns.get(name, [])
-        if len(srcs) == 1 and isinstance(srcs[0], str) and srcs[0] in ctx.arrays:
+        if (def_counts.get(name, 0) == 1 and len(srcs) == 1
+                and isinstance(srcs[0], str) and srcs[0] in ctx.arrays):
             aliases[name] = srcs[0]
     return aliases
 
