@@ -1608,6 +1608,45 @@ class PointerArraySimplification(unittest.TestCase):
         self.assertEqual(orig, opt)
         self.assertEqual(orig[0].strip(), "6")
 
+    def test_repeated_dereference_with_nothing_in_between_is_reused(self):
+        src = ('#include <stdio.h>\nint main() {\n'
+               ' int arr[5] = {10, 20, 30, 40, 50}; int *ptr = arr;\n'
+               ' int first = *ptr; int second = *ptr;\n'
+               ' int total = first + second;\n'
+               ' printf("%d %d %d\\n", first, second, total); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "10 10 20")
+        self.assertGreaterEqual(res["optimisation_stats"]["subexpressions_reused"], 1)
+        # only one dereference should survive -- `ptr` itself may go on to
+        # be eliminated in favour of `arr` by a later pass once the second
+        # read collapses into the first, so look for either spelling
+        self.assertEqual(len(re.findall(r"\*\w+", res["optimised_c"])), 1)
+
+    def test_dereference_is_not_reused_across_a_write_through_the_pointer(self):
+        # between the two reads, `*ptr` is itself written -- the second
+        # read must see the new value, not the first read's cached one.
+        src = ('#include <stdio.h>\nint main() {\n'
+               ' int x = 5; int *ptr = &x;\n'
+               ' int first = *ptr; *ptr = 99; int second = *ptr;\n'
+               ' printf("%d %d\\n", first, second); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "5 99")
+
+    def test_dereference_is_not_reused_across_a_write_to_the_aliased_variable(self):
+        # the write happens through the plain variable `x`, not through
+        # `ptr` -- but `x`'s address was taken, so it is exactly the same
+        # hazard as writing through the pointer directly, and must
+        # likewise invalidate the first read.
+        src = ('#include <stdio.h>\nint main() {\n'
+               ' int x = 5; int *ptr = &x;\n'
+               ' int first = *ptr; x = 99; int second = *ptr;\n'
+               ' printf("%d %d\\n", first, second); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "5 99")
+
 
 class RedundantCalculationElimination(unittest.TestCase):
     """A second loop (or a second call to a provably pure function) that

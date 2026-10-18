@@ -1059,6 +1059,32 @@ def common_subexpression_elimination(instrs: List[Instr], ctx: "OptContext",
                         f"'{instr.extra}({shown})' already computed at line {first_line} "
                         f"(the function is provably pure); call skipped and result reused"))
                     new_instr = Instr("ASSIGN", dest=instr.dest, arg1=holder, line=instr.line)
+            elif instr.op == "UN" and instr.dest and instr.extra != "&":
+                # a read through a pointer (`*ptr`), a negation, or any
+                # other unary expression computed twice from the exact
+                # same operand text, with nothing between the two reads
+                # that could change what that operand names or points to
+                # (checked below, the same way a repeated `BIN` already
+                # is) -- the second one is just the first one's value.
+                # (`&x` is excluded on principle, not because it would be
+                # unsafe to cache -- a plain variable's address never
+                # moves in this IR -- but because nothing calls for
+                # reusing it: it is never itself a redundant *calculation*.)
+                # the key's second slot holds the full reconstructed text
+                # ("*ptr", not just "ptr") so `_memory_kind` -- used by the
+                # invalidation below to recognise a write that could alias
+                # this read -- actually sees it as a memory read, the same
+                # way it already does for a cached `BIN` operand like
+                # `arr[i]` or `*ptr + 1`
+                key = ("un", f"{instr.extra}{instr.arg1}", "")
+                hit = cache.get(key)
+                if hit is not None:
+                    holder, first_line = hit
+                    reused += 1
+                    events.append(OptEvent(instr.line, "cse",
+                        f"'{instr.extra}{_show_operand(instr.arg1)}' already computed at line "
+                        f"{first_line}; value reused"))
+                    new_instr = Instr("ASSIGN", dest=instr.dest, arg1=holder, line=instr.line)
             result.append(new_instr)
 
             # -- invalidate cached expressions this instruction could change --
@@ -1097,9 +1123,11 @@ def common_subexpression_elimination(instrs: List[Instr], ctx: "OptContext",
                                       instr.extra, ctx.type_of(instr.arg1), ctx.type_of(instr.arg2))))
                 if holder_ok:
                     cache[key] = (dest, instr.line)
-            elif instr.op == "CALL" and hit is None and key is not None:
+            elif instr.op in ("CALL", "UN") and hit is None and key is not None:
                 dest = instr.dest
-                if isinstance(dest, str) and _split_indexed(dest) is None and not _is_unsafe_write(dest):
+                if (isinstance(dest, str) and _split_indexed(dest) is None
+                        and not _is_unsafe_write(dest) and _base_name(dest) not in
+                        _extract_uses(instr.arg1)):
                     cache[key] = (dest, instr.line)
 
     return result, reused
