@@ -1451,6 +1451,82 @@ def simplify_pointer_arithmetic(instrs: List[Instr], ctx: "OptContext",
     return [ins for idx, ins in enumerate(out) if idx not in removed_idx], count
 
 
+def _resolve_pointer_alias_text(s: str, aliases: Dict[str, str]) -> Tuple[str, Optional[str]]:
+    """`s` rewritten through `aliases` (a pointer proven to always be
+    `&array[0]` -- see `_pointer_array_aliases`) if it names memory
+    through that pointer: a bare dereference (`*ptr` -> `arr[0]`) or an
+    index off it (`ptr[i]` -> `arr[i]`). Returns the rewritten text (or
+    `s` unchanged) and the pointer name that was resolved (or None) --
+    a *bare* use of the pointer's own value (passed to a function,
+    compared, ...) is deliberately left alone, since that is the same
+    address either way but not textually the same expression (and
+    `sizeof(ptr)` must never become `sizeof(arr)`)."""
+    if s.startswith("*") and s[1:] in aliases:
+        return f"{aliases[s[1:]]}[0]", s[1:]
+    split = _split_indexed(s)
+    if split and split[0] in aliases:
+        name, idx = split
+        return aliases[name] + "".join(f"[{i}]" for i in idx), name
+    return s, None
+
+
+def _resolve_pointer_alias_operand(op, aliases: Dict[str, str]):
+    if op is None:
+        return op, None
+    if isinstance(op, list):
+        used = None
+        new_list = []
+        for item in op:
+            r, u = _resolve_pointer_alias_operand(item, aliases)
+            new_list.append(r)
+            used = used or u
+        return new_list, used
+    new_s, used = _resolve_pointer_alias_text(str(op), aliases)
+    return new_s, used
+
+
+def resolve_pointer_array_aliases(instrs: List[Instr], ctx: "OptContext",
+                                  events: Optional[List[OptEvent]] = None
+                                  ) -> Tuple[List[Instr], int]:
+    """A pointer proven to always hold `&array[0]` (assigned exactly once
+    in the whole function, straight from the array's name, never
+    reassigned and never escaped -- see `_pointer_array_aliases`) is read
+    through for the rest of the function: `*ptr` and `ptr[i]` name
+    exactly the memory `arr[0]` and `arr[i]` already do, so reading or
+    writing through the pointer is rewritten to read or write the array
+    directly. This leaves the pointer's own declaration and assignment
+    with no remaining use, which dead-code/unused-declaration cleanup
+    then removes on its own."""
+    events = events if events is not None else []
+    aliases = _pointer_array_aliases(instrs, ctx)
+    if not aliases:
+        return instrs, 0
+    out: List[Instr] = []
+    count = 0
+    for ins in instrs:
+        op = ins.op
+        used = None
+        if op == "UN" and ins.extra == "*" and isinstance(ins.arg1, str) and ins.arg1 in aliases:
+            new_dest, new_arg1, new_arg2 = ins.dest, f"{aliases[ins.arg1]}[0]", None
+            used, op = ins.arg1, "ASSIGN"
+        else:
+            new_dest, d_used = (_resolve_pointer_alias_text(ins.dest, aliases)
+                                if isinstance(ins.dest, str) else (ins.dest, None))
+            new_arg1, a1_used = _resolve_pointer_alias_operand(ins.arg1, aliases)
+            new_arg2, a2_used = _resolve_pointer_alias_operand(ins.arg2, aliases)
+            used = d_used or a1_used or a2_used
+        if used is None:
+            out.append(ins)
+            continue
+        count += 1
+        events.append(OptEvent(ins.line, "pointer",
+            f"'{_display(used)}' always points at '{_display(aliases[used])}[0]' (assigned once, "
+            f"never reassigned); read/write through it rewritten as array indexing"))
+        out.append(Instr(op, dest=new_dest, arg1=new_arg1, arg2=new_arg2,
+                         extra=None if op == "ASSIGN" else ins.extra, line=ins.line))
+    return out, count
+
+
 # -- pass 2c: redundant self-assignment elimination ------------------------
 def remove_redundant_self_assignments(instrs: List[Instr], ctx: "OptContext",
                                       events: Optional[List[OptEvent]] = None,
@@ -2271,6 +2347,8 @@ def optimize(instrs: List[Instr], globals_: Optional[Set[str]] = None, *,
         ctx.refresh(current)
         current, pa = simplify_pointer_arithmetic(current, ctx, stats.events)
         ctx.refresh(current)
+        current, pb = resolve_pointer_array_aliases(current, ctx, stats.events)
+        ctx.refresh(current)
         current, sa = remove_redundant_self_assignments(current, ctx, stats.events, stats.skipped)
         ctx.refresh(current)
         current, rc = eliminate_redundant_loops(current, ctx, stats.events)
@@ -2289,7 +2367,7 @@ def optimize(instrs: List[Instr], globals_: Optional[Set[str]] = None, *,
         stats.subexpressions_reused += r
         stats.copies_propagated += c
         stats.variables_eliminated += ve
-        stats.pointer_simplifications += pa
+        stats.pointer_simplifications += pa + pb
         stats.redundant_calculations_removed += rc
         stats.dead_stores_removed += d + sa + uc
         stats.unreachable_instructions_removed += u

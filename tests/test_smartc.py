@@ -1574,8 +1574,13 @@ class PointerArraySimplification(unittest.TestCase):
         res, orig, opt = run_both(self, src)
         self.assertEqual(orig, opt)
         self.assertEqual(orig[0].strip(), "15")
-        self.assertIn("p[i]", res["optimised_c"])
+        # `*(p + i)` -> `p[i]` (simplify_pointer_arithmetic), and since `p`
+        # is never anything but `arr`, resolve_pointer_array_aliases goes
+        # one step further and reads `arr[i]` directly, dropping `p` too
+        self.assertIn("arr[i]", res["optimised_c"])
         self.assertNotIn("*(p + i)", res["optimised_c"])
+        self.assertNotIn("p[i]", res["optimised_c"])
+        self.assertNotIn(" p;", res["optimised_c"])
 
     def test_pointer_plus_offset_write_becomes_indexing(self):
         src = ('#include <stdio.h>\nint main() {\n'
@@ -1586,7 +1591,10 @@ class PointerArraySimplification(unittest.TestCase):
         res, orig, opt = run_both(self, src)
         self.assertEqual(orig, opt)
         self.assertEqual(orig[0].strip(), "0 2 4 6 8")
-        self.assertIn("p[i] = ", res["optimised_c"])
+        # same chain as the read case: `*(p + i) = ...` -> `p[i] = ...` ->
+        # `arr[i] = ...`, since `p` never points anywhere but `arr`
+        self.assertIn("arr[i] = ", res["optimised_c"])
+        self.assertNotIn("p[i]", res["optimised_c"])
 
     def test_offset_plus_pointer_order_is_also_simplified(self):
         src = ('#include <stdio.h>\nint main() {\n'
@@ -1646,6 +1654,52 @@ class PointerArraySimplification(unittest.TestCase):
         res, orig, opt = run_both(self, src)
         self.assertEqual(orig, opt)
         self.assertEqual(orig[0].strip(), "5 99")
+
+    def test_pointer_aliased_to_an_array_is_resolved_and_removed(self):
+        # `ptr` is assigned exactly once, straight from `arr`, and never
+        # reassigned -- it is provably `&arr[0]` for the rest of the
+        # function, so every read through it is rewritten to read `arr`
+        # directly and the pointer itself (now unused) disappears.
+        src = ('#include <stdio.h>\nint main() {\n'
+               ' int arr[5] = {10, 20, 30, 40, 50}; int *ptr = arr;\n'
+               ' int sum = 0;\n'
+               ' for (int i = 0; i < 5; i++) { sum = sum + arr[i]; }\n'
+               ' int first = *ptr;\n'
+               ' int second = *ptr;\n'
+               ' printf("%d %d %d\\n", sum, first, second); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "150 10 10")
+        c = res["optimised_c"]
+        self.assertNotIn("ptr", c)
+        self.assertIn("arr[0]", c)
+
+    def test_pointer_is_not_resolved_once_it_is_reassigned(self):
+        # `ptr` is assigned twice (`= arr`, then advanced), so it is no
+        # longer provably `&arr[0]` for the rest of the function -- the
+        # rewrite must not fire, or the second read would silently move
+        # to the wrong element.
+        src = ('#include <stdio.h>\nint main() {\n'
+               ' int arr[3] = {1, 2, 3}; int *ptr = arr;\n'
+               ' int first = *ptr; ptr = ptr + 1; int second = *ptr;\n'
+               ' printf("%d %d\\n", first, second); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "1 2")
+
+    def test_pointer_is_not_resolved_once_its_own_address_is_taken(self):
+        # a second pointer could repoint `ptr` at something other than
+        # `arr` through `*pp = ...` -- the pointer-to-pointer write is
+        # already conservatively treated as "could write anything", so
+        # `ptr` must not be assumed to still be `&arr[0]`.
+        src = ('#include <stdio.h>\nint main() {\n'
+               ' int arr[3] = {1, 2, 3}; int other = 99;\n'
+               ' int *ptr = arr; int **pp = &ptr;\n'
+               ' *pp = &other;\n'
+               ' printf("%d\\n", *ptr); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "99")
 
 
 class RedundantCalculationElimination(unittest.TestCase):
