@@ -26,7 +26,7 @@ from .structurer import Item, structure, render_flat
 from .ast_nodes import Program, FuncDecl, StructDecl, Block, If, While, For
 from .optimizer import (
     _extract_uses, _is_temp, _display, _split_indexed, _is_unsafe_write,
-    SIZEOF_RE,
+    SIZEOF_RE, OptContext,
 )
 
 TYPE_KEYWORD_BASES = {"int", "float", "char", "double", "void"}
@@ -184,7 +184,70 @@ class _Expr:
         return self.text if self.prec >= min_prec else f"({self.text})"
 
 
-def emit_function(fn: IRFunction, structured: bool = True) -> List[str]:
+def _struct_field_types(program: Optional[Program]) -> Dict[str, Dict[str, str]]:
+    """struct/union tag -> {field name -> declared C type}, used to infer
+    the type of a compiler temporary loaded from a member access (`s.f`,
+    `p->f`) when `OptContext.type_of` can't see through it on its own
+    (it has no model of struct layout)."""
+    result: Dict[str, Dict[str, str]] = {}
+    if program is None:
+        return result
+    for sd in _collect_struct_decls(program):
+        result[sd.tag] = {f.name: f.type for f in sd.fields}
+    return result
+
+
+def _chain_type(ctx: "OptContext", struct_types: Dict[str, Dict[str, str]],
+                name: str, ops) -> Optional[str]:
+    t = ctx.type_of(name)
+    for kind, *rest in ops:
+        if t is None:
+            return None
+        if kind == "index":
+            t = t[:-1] if t.endswith("*") else None
+        else:
+            sep, member = rest
+            if sep == "->":
+                if not t.endswith("*"):
+                    return None
+                t = t[:-1]
+            if not t.startswith(("struct ", "union ")):
+                return None
+            fields = struct_types.get(t.split(None, 1)[1])
+            t = fields.get(member) if fields else None
+    return t
+
+
+def _infer_type(ctx: "OptContext", struct_types: Dict[str, Dict[str, str]], operand) -> str:
+    """The C type to declare a compiler temporary with, as close as this
+    tool's type model gets. Falls back to a struct-aware chain walk for
+    a temp loaded from a member access (`OptContext.type_of` has no
+    notion of struct fields), to `unsigned long` for `sizeof(...)`
+    (always returns `size_t`), and to `int` only if every other source
+    of information is exhausted (should not happen for code this tool
+    itself generated, but keeps emission total rather than crashing)."""
+    s = str(operand)
+    t = ctx.type_of(s)
+    if t is not None:
+        return t
+    if s.startswith("*"):
+        inner = _infer_type(ctx, struct_types, s[1:])
+        if inner.endswith("*"):
+            return inner[:-1]
+    elif SIZEOF_RE.match(s):
+        return "unsigned long"
+    else:
+        chain = _split_mixed_chain(s)
+        if chain and chain[1]:
+            name, ops = chain
+            t = _chain_type(ctx, struct_types, name, ops)
+            if t is not None:
+                return t
+    return "int"
+
+
+def emit_function(fn: IRFunction, ctx: "OptContext", struct_types: Dict[str, Dict[str, str]],
+                  structured: bool = True) -> List[str]:
     instrs = fn.instructions
 
     # use counts of every name across the function
@@ -286,7 +349,7 @@ def emit_function(fn: IRFunction, structured: bool = True) -> List[str]:
             e = pending.pop(t)
             pending_deps.pop(t)
             reads_memory.discard(t)
-            add(f"__auto_type {t} = {e.text};", decl=t)
+            add(f"{_infer_type(ctx, struct_types, t)} {t} = {e.text};", decl=t)
 
     def deps_of(*operands) -> set:
         d = set()
@@ -299,7 +362,7 @@ def emit_function(fn: IRFunction, structured: bool = True) -> List[str]:
             e = pending.pop(t)
             pending_deps.pop(t, None)
             reads_memory.discard(t)
-            add(f"__auto_type {t} = {e.text};", decl=t)
+            add(f"{_infer_type(ctx, struct_types, t)} {t} = {e.text};", decl=t)
 
     for idx, ins in enumerate(instrs):
         op = ins.op
@@ -359,7 +422,7 @@ def emit_function(fn: IRFunction, structured: bool = True) -> List[str]:
             dest = ins.dest
             if dest and _is_temp(dest) and defs.get(dest, 0) > 1:
                 flush_dependents(dest)
-                prefix = "" if dest in declared_temps else "__auto_type "
+                prefix = "" if dest in declared_temps else f"{_infer_type(ctx, struct_types, dest)} "
                 declared_temps.add(dest)
                 add(f"{prefix}{dest} = {rhs.text};", decl=None if not prefix else dest,
                     expr=not prefix)
@@ -385,11 +448,11 @@ def emit_function(fn: IRFunction, structured: bool = True) -> List[str]:
                     else:
                         # `(void)(a / b);` is simply dropped by the C compiler, which
                         # would turn a crash into a success; storing the value keeps it
-                        add(f"__auto_type {dest} = {rhs.text};", decl=dest)
+                        add(f"{_infer_type(ctx, struct_types, dest)} {dest} = {rhs.text};", decl=dest)
                         add(f"(void){dest};")
                 else:
                     flush_dependents(dest)
-                    add(f"__auto_type {dest} = {rhs.text};", decl=dest)
+                    add(f"{_infer_type(ctx, struct_types, dest)} {dest} = {rhs.text};", decl=dest)
             elif dest and isinstance(dest, str) and _is_unsafe_write(dest):
                 # a write through a pointer, or to a struct/union
                 # member, may alias anything -- flush everything
@@ -555,6 +618,17 @@ def emit_program(global_instrs: List[Instr], functions: List[IRFunction],
         out.append("")
     global _KEEP_SUFFIX
     global_names = {ins.dest for ins in global_instrs if ins.op == "DECL"}
+    global_types: Dict[str, str] = {}
+    global_arrays: Dict[str, tuple] = {}
+    for ins in global_instrs:
+        if ins.op == "DECL":
+            if ins.arg1 is not None:
+                dims = ins.arg1 if isinstance(ins.arg1, list) else [ins.arg1]
+                global_arrays[ins.dest] = (ins.extra, len(dims))
+            else:
+                global_types[ins.dest] = ins.extra
+    func_returns = {fn.name: fn.return_type for fn in functions}
+    struct_types = _struct_field_types(program)
     for fn in functions:
         _KEEP_SUFFIX = _names_needing_suffix(fn, global_names)
         params = ", ".join(f"{' '.join(p.split()[:-1])} {_name(p.split()[-1])}" for p in fn.params)
@@ -563,7 +637,9 @@ def emit_program(global_instrs: List[Instr], functions: List[IRFunction],
             out.append(sig + ";")
             continue
         out.append(sig + " {")
-        out.extend(emit_function(fn))
+        ctx = OptContext(global_names, global_types, global_arrays, fn.param_types, func_returns)
+        ctx.refresh(fn.instructions)
+        out.extend(emit_function(fn, ctx, struct_types))
         out.append("}")
         out.append("")
     _KEEP_SUFFIX = set()

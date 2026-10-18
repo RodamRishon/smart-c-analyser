@@ -164,6 +164,7 @@ function render(data) {
     <div><span class="n">${stats.unreachable_removed}</span>unreachable removed</div>
     <div><span class="n">${stats.copies_propagated}</span>copies propagated</div>
     <div><span class="n">${stats.pointer_simplifications}</span>pointer expressions simplified</div>
+    <div><span class="n">${stats.redundant_calculations_removed}</span>redundant calculations eliminated</div>
     <div><span class="n">${stats.instructions_before} &rarr; ${stats.instructions_after}</span>instruction count</div>
     <div><span class="n">${data.line_counts.original} &rarr; ${data.line_counts.optimised}</span>line count</div>
   </div>`;

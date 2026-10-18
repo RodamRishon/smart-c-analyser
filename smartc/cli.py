@@ -180,6 +180,7 @@ def run(path: str, out_path=None, show_tokens=60) -> int:
     total_copies = sum(s.copies_propagated for _, s in all_stats)
     total_vars = sum(s.variables_eliminated for _, s in all_stats)
     total_pointer = sum(s.pointer_simplifications for _, s in all_stats)
+    total_redundant = sum(s.redundant_calculations_removed for _, s in all_stats)
     total_after = len(global_instrs_opt) + sum(len(fn.instructions) for fn in functions)
     passes_run = max((s.passes_run for _, s in all_stats), default=0)
 
@@ -220,6 +221,7 @@ def run(path: str, out_path=None, show_tokens=60) -> int:
     print(f"Copies propagated:                  {total_copies}")
     print(f"Single-use variables eliminated:    {total_vars}")
     print(f"Pointer expressions simplified:     {total_pointer}")
+    print(f"Redundant calculations eliminated:  {total_redundant}")
     print(f"\nInstruction count: {total_before} -> {total_after} "
           f"({total_before - total_after} removed)")
 

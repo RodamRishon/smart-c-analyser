@@ -1609,6 +1609,87 @@ class PointerArraySimplification(unittest.TestCase):
         self.assertEqual(orig[0].strip(), "6")
 
 
+class RedundantCalculationElimination(unittest.TestCase):
+    """A second loop (or a second call to a provably pure function) that
+    recomputes a value the program already computed is proven equivalent
+    and dropped, with the later uses reading the first result instead --
+    `eliminate_redundant_loops` / the pure-call CSE extension in
+    `common_subexpression_elimination`. Behaviour (stdout, exit code) must
+    stay identical, and the duplicate work must actually be gone from the
+    emitted C, not just left in place alongside a correct result."""
+
+    def test_array_sum_recomputed_through_an_aliased_pointer_is_reused(self):
+        res, orig, opt = run_both(self, program_text("opt_redundant_array_sum.c"))
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "Sum: 150 Total: 150")
+        self.assertGreaterEqual(res["optimisation_stats"]["redundant_calculations_removed"], 1)
+        c = res["optimised_c"]
+        # only one loop should survive -- the second was proven to compute
+        # exactly the same sum over the same array and removed outright
+        self.assertEqual(c.count("for ("), 1)
+        self.assertNotIn("ptr", c)
+
+    def test_array_sum_recomputed_with_a_renamed_induction_variable_is_reused(self):
+        # same proof, but nothing is shared textually between the loops --
+        # different accumulator name, different induction variable, the
+        # second loop counting down instead of up to the same bound -- so
+        # this exercises the local-variable renaming in the equivalence
+        # check, not just two loops that happen to look identical already.
+        src = ('#include <stdio.h>\nint main() {\n'
+               ' int arr[4] = {1, 2, 3, 4};\n'
+               ' int acc = 0;\n'
+               ' for (int i = 0; i < 4; i++) { acc = acc + arr[i]; }\n'
+               ' int again = 0;\n'
+               ' for (int j = 0; j < 4; j++) { again = again + arr[j]; }\n'
+               ' printf("%d %d\\n", acc, again); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "10 10")
+        self.assertGreaterEqual(res["optimisation_stats"]["redundant_calculations_removed"], 1)
+        self.assertEqual(res["optimised_c"].count("for ("), 1)
+
+    def test_unrelated_loops_are_left_alone(self):
+        # a loop summing a *different* array must never be mistaken for a
+        # repeat of the first -- the proof has to fail, not just happen
+        # not to fire.
+        src = ('#include <stdio.h>\nint main() {\n'
+               ' int a[3] = {1, 2, 3}; int b[3] = {10, 20, 30};\n'
+               ' int sa = 0; for (int i = 0; i < 3; i++) { sa = sa + a[i]; }\n'
+               ' int sb = 0; for (int i = 0; i < 3; i++) { sb = sb + b[i]; }\n'
+               ' printf("%d %d\\n", sa, sb); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "6 60")
+        self.assertEqual(res["optimisation_stats"]["redundant_calculations_removed"], 0)
+        self.assertEqual(res["optimised_c"].count("for ("), 2)
+
+    def test_repeated_call_to_a_pure_function_is_reused(self):
+        src = ('#include <stdio.h>\n'
+               'int square(int n) { return n * n; }\n'
+               'int main() { int x = 7;\n'
+               ' printf("%d\\n", square(x) + square(x)); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "98")
+        self.assertGreaterEqual(res["optimisation_stats"]["subexpressions_reused"], 1)
+        # the call site itself must appear only once in the optimised main
+        # (the function's own definition still names `square` once more) --
+        # the second use reads the first call's result instead of calling again
+        self.assertEqual(res["optimised_c"].count("square(x)") + res["optimised_c"].count("square(7)"), 1)
+
+    def test_repeated_call_to_a_function_with_side_effects_is_kept(self):
+        # a function that writes a global is not pure: a second call with
+        # the same arguments could still see a different result, so both
+        # calls must survive.
+        src = ('#include <stdio.h>\n'
+               'int counter = 0;\n'
+               'int tick(int n) { counter = counter + 1; return n + counter; }\n'
+               'int main() { printf("%d\\n", tick(10) + tick(10)); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(res["optimised_c"].count("tick(10)"), 2)
+
+
 class ChainedComparisonEmission(unittest.TestCase):
     """A relational/equality comparison used as the operand of another
     one at the same precedence (`(a <= b) >= c`) must come back out

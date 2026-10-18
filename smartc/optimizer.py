@@ -123,6 +123,7 @@ EVENT_LABELS = {
     "dead-store": "Dead Code Elimination",
     "unreachable": "Dead Code Elimination",
     "pointer": "Pointer/Array Simplification",
+    "redundant-calc": "Redundant Calculation Elimination",
 }
 
 # Optimisations a compiler textbook would list that this tool does NOT
@@ -132,7 +133,9 @@ UNSUPPORTED_OPTIMISATIONS = [
     "Strength reduction (e.g. x * 2 -> x << 1)",
     "Loop unrolling and loop fusion",
     "Function inlining and interprocedural constant propagation",
-    "Common subexpression elimination across basic blocks (global value numbering)",
+    "General cross-block common subexpression elimination (global value "
+        "numbering) for arbitrary expressions -- only whole equivalent loops "
+        "and repeated calls to a provably pure function are recognised",
     "Removal of unused functions",
     "Re-structuring goto/label control flow back into if/while/for",
     "Scalar replacement of arrays and structs",
@@ -157,6 +160,7 @@ class OptimizationStats:
     copies_propagated: int = 0
     variables_eliminated: int = 0
     pointer_simplifications: int = 0
+    redundant_calculations_removed: int = 0
     passes_run: int = 0
     converged: bool = True
     events: List[OptEvent] = field(default_factory=list)
@@ -167,7 +171,7 @@ class OptimizationStats:
                 + self.subexpressions_reused
                 + self.dead_stores_removed + self.unreachable_instructions_removed
                 + self.copies_propagated + self.variables_eliminated
-                + self.pointer_simplifications)
+                + self.pointer_simplifications + self.redundant_calculations_removed)
 
 
 # -- shared helpers --------------------------------------------------------
@@ -351,13 +355,14 @@ class OptContext:
     whose address is taken)."""
 
     def __init__(self, globals_=(), global_types=None, global_arrays=None,
-                 param_types=None, func_returns=None):
+                 param_types=None, func_returns=None, pure_functions=None):
         self.globals = set(globals_)
         self.global_types = dict(global_types or {})
         self.global_arrays = dict(global_arrays or {})
         self.param_types = dict(param_types or {})
         self.func_returns = dict(LIBRARY_RETURNS)
         self.func_returns.update(func_returns or {})
+        self.pure_functions: Set[str] = set(pure_functions or ())
         self.vars: Dict[str, str] = {}
         self.arrays: Dict[str, Tuple[str, int]] = {}
         self.array_dims: Dict[str, List[int]] = {}
@@ -1024,6 +1029,7 @@ def common_subexpression_elimination(instrs: List[Instr], ctx: "OptContext",
         for instr in block:
             new_instr = instr
             hit = None
+            key = None
             if instr.op == "BIN":
                 key = (instr.extra, str(instr.arg1), str(instr.arg2))
                 alt_key = (instr.extra, str(instr.arg2), str(instr.arg1)) \
@@ -1035,6 +1041,23 @@ def common_subexpression_elimination(instrs: List[Instr], ctx: "OptContext",
                     events.append(OptEvent(instr.line, "cse",
                         f"'{_show_operand(instr.arg1)} {instr.extra} {_show_operand(instr.arg2)}' "
                         f"already computed at line {first_line}; value reused"))
+                    new_instr = Instr("ASSIGN", dest=instr.dest, arg1=holder, line=instr.line)
+            elif instr.op == "CALL" and instr.dest and instr.extra in ctx.pure_functions:
+                # a call to a function proven to have no effect beyond its
+                # return value (see `compute_pure_functions`) is just another
+                # expression: the same function called with the same
+                # argument values gives the same result, so the second call
+                # can be skipped exactly like a repeated `BIN`.
+                args_text = ", ".join(str(a) for a in (instr.arg1 or []))
+                key = (f"call {instr.extra}", args_text, "")
+                hit = cache.get(key)
+                if hit is not None:
+                    holder, first_line = hit
+                    reused += 1
+                    shown = ", ".join(_show_operand(a) for a in (instr.arg1 or []))
+                    events.append(OptEvent(instr.line, "cse",
+                        f"'{instr.extra}({shown})' already computed at line {first_line} "
+                        f"(the function is provably pure); call skipped and result reused"))
                     new_instr = Instr("ASSIGN", dest=instr.dest, arg1=holder, line=instr.line)
             result.append(new_instr)
 
@@ -1073,6 +1096,10 @@ def common_subexpression_elimination(instrs: List[Instr], ctx: "OptContext",
                                   or ctx.type_of(dest) == _binary_result_type(
                                       instr.extra, ctx.type_of(instr.arg1), ctx.type_of(instr.arg2))))
                 if holder_ok:
+                    cache[key] = (dest, instr.line)
+            elif instr.op == "CALL" and hit is None and key is not None:
+                dest = instr.dest
+                if isinstance(dest, str) and _split_indexed(dest) is None and not _is_unsafe_write(dest):
                     cache[key] = (dest, instr.line)
 
     return result, reused
@@ -1495,6 +1522,380 @@ def remove_redundant_self_assignments(instrs: List[Instr], ctx: "OptContext",
     return out, removed
 
 
+# -- pass 2f: redundant calculation elimination (loops & pure calls) -------
+#
+# Two generalisations of ordinary CSE, both proving equivalence instead of
+# assuming it:
+#
+# * Repeated calls to the same provably *pure* function with the same
+#   argument values (`sq(a) + sq(a)`, or two calls far apart with nothing
+#   in between that could change the arguments) -- the second call is
+#   replaced by the first call's result. Purity is a whole-program, fixed
+#   point property (`_pure_functions`): a function is pure if it never
+#   writes a global or anything reached through a pointer/array parameter,
+#   never reads a global (so its result depends only on its arguments),
+#   and never calls anything that is not itself already known pure.
+#
+# * Two loops that compute the same thing over the same data -- one
+#   written as a direct array loop, the other through a pointer that is
+#   proven (by `_pointer_array_aliases`) to always point at the start of
+#   that same array, or just written with differently-named local
+#   variables. `_loops_equivalent` proves this by walking both loop
+#   bodies in lock-step, building a one-to-one renaming between the
+#   variables genuinely local to each loop (temporaries, the induction
+#   variable, the accumulator) while requiring every other name (the
+#   array, a global, a loop bound that comes from outside) to match
+#   *exactly* -- so this never "guesses" that two loops agree; a mismatch
+#   anywhere (a different array, a different operator, an extra
+#   statement, a call, a nested return) simply fails the proof and both
+#   loops are left alone. When a match is found and nothing between the
+#   two loops could have changed the inputs the proof depended on, the
+#   second loop is deleted outright and its outputs assigned from the
+#   first loop's.
+def _pointer_array_aliases(instrs: List[Instr], ctx: "OptContext") -> Dict[str, str]:
+    """Local pointer variables assigned exactly once in the whole
+    function, straight from a declared array's name (`int *p = arr;`,
+    the array decaying to a pointer to its first element) -- `p` and
+    `arr` then always name the same memory for the rest of the
+    function, so `p[i]` and `arr[i]` are the same read/write."""
+    assigns: Dict[str, List] = {}
+    for ins in instrs:
+        if ins.op == "ASSIGN" and isinstance(ins.dest, str):
+            assigns.setdefault(ins.dest, []).append(ins.arg1)
+    aliases: Dict[str, str] = {}
+    for name, t in ctx.vars.items():
+        if not _is_ptr(t) or name in ctx.escaped or name in ctx.param_types:
+            continue
+        srcs = assigns.get(name, [])
+        if len(srcs) == 1 and isinstance(srcs[0], str) and srcs[0] in ctx.arrays:
+            aliases[name] = srcs[0]
+    return aliases
+
+
+def _find_top_level_loops(instrs: List[Instr]) -> List[Tuple[int, int]]:
+    """Index ranges `[s, e]` (inclusive) of every `for`/`while` loop this
+    IR generator can produce, in program order, skipping over a loop's
+    own body so a nested loop is never also reported on its own (only
+    the outermost loop of a nest is a candidate for matching a sibling
+    outer loop -- an identical nested loop inside is already part of
+    what gets compared). Matches the shape `ir.py` emits for both
+    `while` and `for`: a LABEL that some later GOTO jumps back to
+    (nothing in between has to be a particular shape -- the condition
+    test, the body, and a `for`'s update can be anything), immediately
+    followed by the loop's own end LABEL. Label names are unique per
+    loop (each is its own `L_for<N>` / `L_while<N>`), so the nearest
+    GOTO back to a given LABEL is unambiguously that loop's own
+    backedge, never a nested loop's."""
+    loops = []
+    i, n = 0, len(instrs)
+    while i < n:
+        ins = instrs[i]
+        if ins.op == "LABEL":
+            g = next((k for k in range(i + 1, n)
+                      if instrs[k].op == "GOTO" and instrs[k].dest == ins.dest), None)
+            if g is not None and g + 1 < n and instrs[g + 1].op == "LABEL":
+                loops.append((i, g + 1))
+                i = g + 2
+                continue
+        i += 1
+    return loops
+
+
+_MIXED_TOKEN_RE = re.compile(r"([A-Za-z_]\w*)")
+
+
+def _collect_loop_locals(body: List[Instr]) -> Optional[Set[str]]:
+    """Names defined inside the loop body that are safe to rename when
+    matching it against another loop (temporaries, the induction
+    variable, an accumulator -- any plain scalar this pass itself
+    defines there, plus the loop's own internal labels). Returns None
+    if the body contains anything this pass refuses to reason about at
+    all: a call (unknown side effects -- duplicating or dropping one
+    would change observable behaviour), a return (changes control flow
+    in a way this pass does not model), or a declaration (a
+    loop-scoped variable, not worth the extra bookkeeping)."""
+    names: Set[str] = set()
+    for ins in body:
+        if ins.op in ("CALL", "RETURN", "DECL"):
+            return None
+        if ins.op == "LABEL":
+            names.add(ins.dest)
+        elif ins.op in ("ASSIGN", "BIN", "UN", "CAST") and isinstance(ins.dest, str) \
+                and IDENT_TOKEN_RE.fullmatch(ins.dest):
+            names.add(ins.dest)
+    return names
+
+
+def _loop_live_in_locals(body: List[Instr], local: Set[str]) -> Set[str]:
+    """Local names read in the body before anything inside the body has
+    defined them -- i.e. the loop depends on the value they already
+    hold on entry (the induction variable, an accumulator), not just on
+    a value it computes itself (an ordinary temporary)."""
+    defined: Set[str] = set()
+    live_in: Set[str] = set()
+    for ins in body:
+        _, uses = _def_use(ins)
+        for u in uses:
+            if u in local and u not in defined:
+                live_in.add(u)
+        dest, _ = _def_use_raw(ins)
+        if dest:
+            defined.add(dest)
+    return live_in
+
+
+def _match_mixed_operand(a, b, local_a: Set[str], local_b: Set[str],
+                         aliases: Dict[str, str], a2b: Dict[str, str], b2a: Dict[str, str]) -> bool:
+    """Matches one operand of one instruction from each loop, token by
+    token: identifier tokens that are local to their own loop are free
+    to be renamed (consistently, both ways -- the mapping being built
+    up in `a2b`/`b2a`), but everything else (an array name, a global, a
+    bound, an operator, a bracket, a number) must be character-for-
+    character identical once pointer/array aliases are resolved, which
+    is what proves the two loops read and write the very same memory
+    and quantities, not merely similarly-shaped ones."""
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, list) or isinstance(b, list):
+        if not (isinstance(a, list) and isinstance(b, list)) or len(a) != len(b):
+            return False
+        return all(_match_mixed_operand(x, y, local_a, local_b, aliases, a2b, b2a)
+                   for x, y in zip(a, b))
+    parts_a = _MIXED_TOKEN_RE.split(str(a))
+    parts_b = _MIXED_TOKEN_RE.split(str(b))
+    if len(parts_a) != len(parts_b):
+        return False
+    for i, (pa, pb) in enumerate(zip(parts_a, parts_b)):
+        if i % 2 == 0:
+            if pa != pb:
+                return False
+            continue
+        if pa in TYPE_KEYWORD_BASES or pb in TYPE_KEYWORD_BASES:
+            if pa != pb:
+                return False
+            continue
+        ia, ib = pa in local_a, pb in local_b
+        if ia != ib:
+            return False
+        if not ia:
+            if aliases.get(pa, pa) != aliases.get(pb, pb):
+                return False
+            continue
+        if pa in a2b:
+            if a2b[pa] != pb:
+                return False
+        elif pb in b2a:
+            return False
+        else:
+            a2b[pa], b2a[pb] = pb, pa
+    return True
+
+
+def _instrs_equivalent(ia: Instr, ib: Instr, local_a, local_b, aliases, a2b, b2a) -> bool:
+    if ia.op != ib.op or ia.extra != ib.extra:
+        return False
+    if ia.op in ("LABEL", "GOTO"):
+        return _match_mixed_operand(ia.dest, ib.dest, local_a, local_b, aliases, a2b, b2a)
+    fields = (
+        _match_mixed_operand(ia.dest, ib.dest, local_a, local_b, aliases, a2b, b2a),
+        _match_mixed_operand(ia.arg1, ib.arg1, local_a, local_b, aliases, a2b, b2a),
+        _match_mixed_operand(ia.arg2, ib.arg2, local_a, local_b, aliases, a2b, b2a),
+    )
+    return all(fields)
+
+
+def _const_held_before(instrs: List[Instr], idx: int, var: str) -> Optional[str]:
+    """The constant text `var` is known to hold immediately before
+    `instrs[idx]`, found by scanning backward for its nearest preceding
+    definition -- but only up to the nearest LABEL (a possible join
+    point with another predecessor this simple scan cannot see), past
+    which the value is treated as unknown rather than guessed."""
+    for k in range(idx - 1, -1, -1):
+        ins = instrs[k]
+        if ins.op == "LABEL":
+            return None
+        dest, _ = _def_use_raw(ins)
+        if dest == var:
+            return ins.arg1 if ins.op == "ASSIGN" and _is_const(ins.arg1) else None
+    return None
+
+
+def _loops_equivalent(instrs: List[Instr], sA: int, eA: int, sB: int, eB: int,
+                      aliases: Dict[str, str]) -> Optional[Dict[str, str]]:
+    """Proves loop B (`[sB, eB]`) computes exactly what loop A
+    (`[sA, eA]`) already computed, and if so returns the renaming from
+    B's locals to A's locals (so the caller can forward A's results in
+    place of B's); otherwise returns None, including whenever something
+    about the two loops can't be proven equivalent rather than being
+    disproven -- this pass only ever acts on a positive proof."""
+    body_a, body_b = instrs[sA:eA + 1], instrs[sB:eB + 1]
+    if len(body_a) != len(body_b):
+        return None
+    local_a, local_b = _collect_loop_locals(body_a), _collect_loop_locals(body_b)
+    if local_a is None or local_b is None:
+        return None
+    a2b: Dict[str, str] = {}
+    b2a: Dict[str, str] = {}
+    for ia, ib in zip(body_a, body_b):
+        if not _instrs_equivalent(ia, ib, local_a, local_b, aliases, a2b, b2a):
+            return None
+    # the value each loop-carried local (induction variable, accumulator)
+    # starts with must provably agree too -- matching bodies alone only
+    # proves the two loops do the same thing to whatever they start with
+    for va in _loop_live_in_locals(body_a, local_a):
+        vb = a2b.get(va)
+        if vb is None:
+            return None
+        ca = _const_held_before(instrs, sA, va)
+        cb = _const_held_before(instrs, sB, vb)
+        if ca is None or cb is None or ca != cb:
+            return None
+    return b2a
+
+
+def _loop_free_names(body: List[Instr], local: Set[str], aliases: Dict[str, str]) -> Set[str]:
+    """Every (alias-resolved) base name the loop reads or writes that is
+    *not* one of its own local variables -- the array it sums, a bound
+    read from a variable, anything from outside the loop its proof of
+    equivalence depended on staying unchanged."""
+    free: Set[str] = set()
+    for ins in body:
+        for operand in (ins.dest, ins.arg1, ins.arg2):
+            for tok in IDENT_TOKEN_RE.findall(str(operand)) if operand is not None else ():
+                if tok not in local and tok not in TYPE_KEYWORD_BASES:
+                    free.add(aliases.get(tok, tok))
+    return free
+
+
+def _gap_is_safe(instrs: List[Instr], eA: int, sB: int, forbidden: Set[str],
+                 ctx: "OptContext", aliases: Dict[str, str]) -> bool:
+    """True if nothing between the end of loop A and the start of loop B
+    could have changed any name the equivalence proof relied on staying
+    put: the array/bound loop A read, or the result loop A produced."""
+    for k in range(eA + 1, sB):
+        ins = instrs[k]
+        if ins.op == "CALL":
+            return False            # unknown effects -- may write anywhere escaped
+        dest = ins.dest if ins.op in ("ASSIGN", "BIN", "UN", "CAST") else None
+        if dest is None:
+            continue
+        if ctx.writes_unknown(dest):
+            return False
+        base = _base_name(str(dest))
+        if base in forbidden:
+            return False          # a plain write to the name itself
+        if _split_indexed(str(dest)) is not None and aliases.get(base, base) in forbidden:
+            return False          # `ptr[i] = ...` writes through an array alias
+    return True
+
+
+def eliminate_redundant_loops(instrs: List[Instr], ctx: "OptContext",
+                              events: Optional[List[OptEvent]] = None) -> Tuple[List[Instr], int]:
+    events = events if events is not None else []
+    loops = _find_top_level_loops(instrs)
+    if len(loops) < 2:
+        return instrs, 0
+    aliases = _pointer_array_aliases(instrs, ctx)
+
+    def _loop_line(s: int, e: int) -> int:
+        # LABEL instructions carry no source line of their own; the next
+        # one that does (the condition test, almost always) is as close
+        # to "where this loop starts" as the IR keeps.
+        return next((instrs[k].line for k in range(s, e + 1) if instrs[k].line), 0)
+
+    for bi in range(1, len(loops)):
+        sB, eB = loops[bi]
+        for ai in range(bi):
+            sA, eA = loops[ai]
+            b2a = _loops_equivalent(instrs, sA, eA, sB, eB, aliases)
+            if b2a is None:
+                continue
+            # every B-local that carries a value out of the loop (a plain,
+            # typed variable -- never a bare temporary, which this IR never
+            # reads again outside the instruction that defines it, and
+            # never the induction variable when both loops literally share
+            # it, since then nothing needs forwarding) is forwarded from
+            # A's corresponding one instead of being recomputed; a type
+            # mismatch anywhere voids the whole match, since forwarding it
+            # unconverted would silently change its value
+            repl: List[Instr] = []
+            ok = True
+            for vb, va in b2a.items():
+                if vb == va or vb not in ctx.vars or va not in ctx.vars:
+                    continue       # a label, or a temporary -- nothing to forward
+                tva, tvb = ctx.type_of(va), ctx.type_of(vb)
+                if tva is None or tva != tvb:
+                    ok = False
+                    break
+                repl.append(Instr("ASSIGN", dest=vb, arg1=va, line=_loop_line(sB, eB)))
+            if not ok:
+                continue
+            # only the names loop A's proof actually depended on, plus the
+            # loop-A variables about to be forwarded above, have to survive
+            # unchanged between the two loops -- the induction variable (or
+            # any other local resetting itself before loop B runs again) is
+            # not one of them
+            local_a = _collect_loop_locals(instrs[sA:eA + 1]) or set()
+            forbidden = ({r.arg1 for r in repl}
+                        | _loop_free_names(instrs[sA:eA + 1], local_a, aliases))
+            if not _gap_is_safe(instrs, eA, sB, forbidden, ctx, aliases):
+                continue
+            line_a, line_b = _loop_line(sA, eA), _loop_line(sB, eB)
+            events.append(OptEvent(line_b, "redundant-calc",
+                f"loop at line {line_b} recomputes exactly what the loop at "
+                f"line {line_a} already computed; removed and its result(s) reused"))
+            return instrs[:sB] + repl + instrs[eB + 1:], 1
+    return instrs, 0
+
+
+def _is_global_name(name: str, ctx: "OptContext") -> bool:
+    return name in ctx.globals
+
+
+def _function_is_pure(fn, ctx_globals: Set[str], pure_so_far: Set[str]) -> bool:
+    """A function is pure if its result can only depend on its argument
+    values: it never writes a global or anything reached through a
+    pointer/array it was handed (that write would be invisible in its
+    argument list, so a second call with textually-equal arguments
+    could still see a different result), never reads a global either
+    (same reasoning, for reads), and never calls anything not already
+    known pure (including itself, for simple recursion -- `pure_so_far`
+    starts optimistic and this is run to a fixed point by the caller)."""
+    param_names = set(fn.param_types)
+    for ins in fn.instructions:
+        if ins.op == "CALL" and ins.extra not in pure_so_far:
+            return False
+        dest, uses = _def_use_raw(ins)
+        if isinstance(dest, str):
+            if _is_unsafe_write(dest):
+                return False         # *p = / s.f = / p->f = -- may write through any pointer
+            split = _split_indexed(dest)
+            if split is not None:
+                return False         # a[i] = -- a may be (or alias) a parameter
+            if dest in ctx_globals:
+                return False
+        for u in uses:
+            if u in ctx_globals:
+                return False
+    return True
+
+
+def compute_pure_functions(functions, globals_: Set[str]) -> Set[str]:
+    """Fixed-point purity analysis across every function in the program
+    (see `_function_is_pure`); used to gate caching a `CALL`'s result
+    across unrelated code the way `common_subexpression_elimination`
+    already caches a `BIN`'s."""
+    pure = {fn.name for fn in functions}
+    changed = True
+    while changed:
+        changed = False
+        for fn in functions:
+            if fn.name in pure and not _function_is_pure(fn, globals_, pure):
+                pure.discard(fn.name)
+                changed = True
+    return pure
+
+
 # -- pass 3: dead code elimination -----------------------------------------
 def _build_cfg(blocks: List[List[Instr]]):
     label_to_block = {
@@ -1804,20 +2205,24 @@ def optimize(instrs: List[Instr], globals_: Optional[Set[str]] = None, *,
              global_types: Optional[Dict[str, str]] = None,
              global_arrays: Optional[Dict[str, Tuple[str, int]]] = None,
              param_types: Optional[Dict[str, str]] = None,
-             func_returns: Optional[Dict[str, str]] = None
+             func_returns: Optional[Dict[str, str]] = None,
+             pure_functions: Optional[Set[str]] = None
              ) -> Tuple[List[Instr], OptimizationStats]:
     """Runs the passes to a fixed point. `globals_` names variables that
     outlive the function (other functions may read them), so stores to
     them are never treated as dead. The keyword arguments describe the
     types the passes need (see OptContext); without them the passes
     still run but refuse any rewrite that depends on an unknown type.
+    `pure_functions` (see `compute_pure_functions`) gates caching a
+    `CALL`'s result across code the way an ordinary expression already is.
 
     Iteration stops when a whole round changes nothing. A round cap
     (MAX_ITERATIONS) guards against a pass pair that keeps undoing each
     other's work; `stats.converged` records whether the cap was hit."""
     globals_ = set(globals_ or ())
     stats = OptimizationStats()
-    ctx = OptContext(globals_, global_types, global_arrays, param_types, func_returns)
+    ctx = OptContext(globals_, global_types, global_arrays, param_types, func_returns,
+                     pure_functions)
     current = instrs
     stats.converged = False
 
@@ -1839,6 +2244,8 @@ def optimize(instrs: List[Instr], globals_: Optional[Set[str]] = None, *,
         current, pa = simplify_pointer_arithmetic(current, ctx, stats.events)
         ctx.refresh(current)
         current, sa = remove_redundant_self_assignments(current, ctx, stats.events, stats.skipped)
+        ctx.refresh(current)
+        current, rc = eliminate_redundant_loops(current, ctx, stats.events)
         # Liveness only sees names. A variable whose address was taken can
         # also be read through a pointer (`*p`) or by a callee, so a store
         # to it is never "dead" -- treat it like a global from here on.
@@ -1855,6 +2262,7 @@ def optimize(instrs: List[Instr], globals_: Optional[Set[str]] = None, *,
         stats.copies_propagated += c
         stats.variables_eliminated += ve
         stats.pointer_simplifications += pa
+        stats.redundant_calculations_removed += rc
         stats.dead_stores_removed += d + sa + uc
         stats.unreachable_instructions_removed += u
         if [str(x) for x in current] == before:
@@ -1899,7 +2307,9 @@ def optimize_program(global_instrs: List[Instr], functions
             else:
                 global_types[ins.dest] = ins.extra
     func_returns = {fn.name: fn.return_type for fn in functions}
-    kw = dict(global_types=global_types, global_arrays=global_arrays, func_returns=func_returns)
+    pure_functions = compute_pure_functions(functions, global_names)
+    kw = dict(global_types=global_types, global_arrays=global_arrays, func_returns=func_returns,
+              pure_functions=pure_functions)
 
     global_opt, g_stats = optimize(global_instrs, global_names, **kw)
     all_stats = [("<globals>", g_stats)]

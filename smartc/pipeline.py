@@ -156,6 +156,7 @@ def analyze(source: str) -> dict:
         "copies_propagated": sum(s.copies_propagated for _, s in all_stats),
         "variables_eliminated": sum(s.variables_eliminated for _, s in all_stats),
         "pointer_simplifications": sum(s.pointer_simplifications for _, s in all_stats),
+        "redundant_calculations_removed": sum(s.redundant_calculations_removed for _, s in all_stats),
         "converged": all(st.converged for _, st in all_stats),
         "instructions_before": total_before,
         "instructions_after": total_after,
