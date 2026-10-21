@@ -357,6 +357,9 @@ def emit_function(fn: IRFunction, ctx: "OptContext", struct_types: Dict[str, Dic
     # (`int *p = &b; ... b = 2;`), so these are materialised before one.
     reads_memory: set = set()
     consumed_memory = [False]
+    # variables read by the pending temps that render() has inlined into the
+    # expression currently being built (dependencies must be transitive)
+    consumed_deps: List[set] = [set()]
     pending_deps: Dict[str, set] = {}    # temp -> variables its value depends on
     lines: List[Item] = []
     # (index in `lines`, C type text, variable name) of the declaration that
@@ -373,7 +376,7 @@ def emit_function(fn: IRFunction, ctx: "OptContext", struct_types: Dict[str, Dic
         s = str(x)
         if s in pending:
             e = pending.pop(s)
-            pending_deps.pop(s, None)
+            consumed_deps[0] |= pending_deps.pop(s, set())
             pending_bin.pop(s, None)
             if s in reads_memory:
                 reads_memory.discard(s)
@@ -461,6 +464,7 @@ def emit_function(fn: IRFunction, ctx: "OptContext", struct_types: Dict[str, Dic
                     open_decl[0] = (len(lines) - 1, ins.extra, _name(ins.dest))
         elif op in ("BIN", "UN", "ASSIGN", "CALL", "CAST"):
             consumed_memory[0] = False
+            consumed_deps[0] = set()
             # (extra, a, b): the *immediate* operand texts of the single
             # BIN this value reduces to (itself, or one single-use temp
             # away from it, via `pending_bin`) -- see
@@ -509,7 +513,7 @@ def emit_function(fn: IRFunction, ctx: "OptContext", struct_types: Dict[str, Dic
                     _extract_uses(instrs[idx + 1].arg1) | _extract_uses(instrs[idx + 1].arg2))
                 if single_use and (op != "CALL" or next_uses):
                     pending[dest] = rhs
-                    pending_deps[dest] = deps_of(ins.arg1, ins.arg2)
+                    pending_deps[dest] = deps_of(ins.arg1, ins.arg2) | consumed_deps[0]
                     if compound_src is not None:
                         pending_bin[dest] = compound_src
                     operands = [ins.arg1, ins.arg2] if op != "CALL" else list(ins.arg1 or [])

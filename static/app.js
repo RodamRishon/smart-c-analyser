@@ -3,17 +3,28 @@ const resultsEl = document.getElementById("results");
 const statusEl = document.getElementById("status");
 const fileInput = document.getElementById("file-input");
 
+const gutterEl = document.getElementById("gutter");
+function updateGutter() {
+  const n = sourceEl.value.split("\n").length;
+  let t = "";
+  for (let i = 1; i <= n; i++) t += i + (i < n ? "\n" : "");
+  gutterEl.textContent = t;
+  gutterEl.scrollTop = sourceEl.scrollTop;
+}
+sourceEl.addEventListener("input", updateGutter);
+sourceEl.addEventListener("scroll", () => { gutterEl.scrollTop = sourceEl.scrollTop; });
 const SAMPLE = sourceEl.value;
+updateGutter();
 
 document.getElementById("sample-btn").addEventListener("click", () => {
-  sourceEl.value = SAMPLE;
+  sourceEl.value = SAMPLE; updateGutter();
 });
 
 fileInput.addEventListener("change", () => {
   const file = fileInput.files[0];
   if (!file) return;
   const reader = new FileReader();
-  reader.onload = () => { sourceEl.value = reader.result; };
+  reader.onload = () => { sourceEl.value = reader.result; updateGutter(); };
   reader.readAsText(file);
 });
 

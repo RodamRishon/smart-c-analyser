@@ -1226,7 +1226,8 @@ class OptimisationReport(unittest.TestCase):
 
     def test_unsupported_list_never_claims_what_is_implemented(self):
         unsupported = " ".join(self.report("int main() { return 0; }\n")["unsupported"]).lower()
-        for implemented in ("constant folding", "dead code", "copy propagation"):
+        for implemented in ("constant folding", "dead code", "copy propagation",
+                            "re-structuring", "if/while/for"):
             self.assertNotIn(implemented, unsupported)
 
     def test_cli_prints_all_three_sections(self):
@@ -1429,6 +1430,29 @@ class OptimiserSafetyRegressions(unittest.TestCase):
         self.assertIn("arr[k] = arr[k]", c)                 # index not proven in range: kept
         kept = " ".join(e["message"] for e in res["optimisation_report"]["detected_not_applied"])
         self.assertIn("arr[k] = arr[k]", kept)
+
+    def test_inlined_expression_not_moved_past_write_to_indirect_operand(self):
+        # `c % 31 * 3` reads c through a pending temporary; the later `c += 5`
+        # must not be emitted ahead of it (found by the differential fuzzer)
+        src = ('#include <stdio.h>\nvoid show(int c) {\n    int a = (c % 31) * 3;\n'
+               '    c += 5;\n    printf("%d %d\\n", a, c);\n}\n'
+               'int main() { show(16); return 0; }\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(orig[0].strip(), "48 21")
+
+    def test_dead_store_note_does_not_claim_a_used_variable_was_never_used(self):
+        # `a` is read in `c * a`; constant propagation replaces that read, so the
+        # store becomes dead -- but the note must not say `a` was "never used"
+        src = ('#include <stdio.h>\nint main() {\n    int a = 10;\n    int c = a + 20;\n'
+               '    int r = c * a;\n    int unused = 7;\n    printf("%d\\n", r);\n    return 0;\n}\n')
+        res, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        notes = {e["line"]: e["message"] for e in res["optimisation_report"]["applied"]
+                 if e["label"].startswith("Dead Code")}
+        self.assertIn("no longer read", notes[3])
+        self.assertNotIn("never used", notes[3])
+        self.assertIn("never used", notes[6])                 # really unused: still says so
 
     def test_parameter_pointer_self_assignment_is_kept(self):
         # `*p = *p` for a parameter that may be NULL: removing it would turn a crash into success

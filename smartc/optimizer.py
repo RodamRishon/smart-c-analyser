@@ -137,7 +137,6 @@ UNSUPPORTED_OPTIMISATIONS = [
         "numbering) for arbitrary expressions -- only whole equivalent loops "
         "and repeated calls to a provably pure function are recognised",
     "Removal of unused functions",
-    "Re-structuring goto/label control flow back into if/while/for",
     "Scalar replacement of arrays and structs",
 ]
 
@@ -2356,6 +2355,9 @@ def _drop_unused_decls(instrs: List[Instr], globals_: Set[str]) -> List[Instr]:
 MAX_ITERATIONS = 30
 
 
+_NEVER_USED_RE = re.compile(r"value assigned to '(.+)' is never used; assignment removed")
+
+
 def optimize(instrs: List[Instr], globals_: Optional[Set[str]] = None, *,
              global_types: Optional[Dict[str, str]] = None,
              global_arrays: Optional[Dict[str, Tuple[str, int]]] = None,
@@ -2380,6 +2382,13 @@ def optimize(instrs: List[Instr], globals_: Optional[Set[str]] = None, *,
                      pure_functions)
     current = instrs
     stats.converged = False
+    # names the *source* reads (an instruction reading its own destination,
+    # as in `x = x + 1`, does not count), so a later dead-store note can say
+    # whether the variable was really never used or just stopped being read
+    read_in_source: Set[str] = set()
+    for ins in instrs:
+        d, uses = _def_use(ins)
+        read_in_source |= {_display(u) for u in uses if u != d}
 
     for _ in range(MAX_ITERATIONS):
         before = [str(x) for x in current]
@@ -2427,6 +2436,12 @@ def optimize(instrs: List[Instr], globals_: Optional[Set[str]] = None, *,
             break
 
     current = _drop_unused_decls(current, globals_)
+
+    for e in stats.events:
+        m = _NEVER_USED_RE.fullmatch(e.message) if e.kind == "dead-store" else None
+        if m and m.group(1) in read_in_source:
+            e.message = (f"'{m.group(1)}' is no longer read after optimisation (its uses were "
+                         f"replaced by its value or removed); assignment removed")
 
     stats.events = _dedupe(stats.events)
     stats.skipped = _dedupe(stats.skipped)

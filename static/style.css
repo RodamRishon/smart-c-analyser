@@ -77,18 +77,46 @@ button.primary {
   position: absolute; inset: 0; opacity: 0; cursor: pointer;
 }
 
-#source {
+.editor {
   flex: 1;
-  width: 100%;
-  resize: none;
+  display: flex;
+  min-height: 0;
   background: var(--panel);
   border: 1px solid var(--panel-border);
   border-radius: 8px;
+  overflow: hidden;
+}
+
+#gutter {
+  margin: 0;
+  padding: 0.9rem 0.6rem 0.9rem 0.8rem;
+  min-width: 3rem;
+  text-align: right;
+  overflow: hidden;
+  user-select: none;
+  color: var(--muted, #6e7681);
+  align-self: stretch;
+  max-height: none;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+#source {
+  flex: 1;
+  min-width: 0;
+  resize: none;
+  background: transparent;
+  border: 0;
+  border-left: 1px solid var(--panel-border);
+  outline: none;
   color: var(--text);
   font-family: var(--mono);
   font-size: 0.85rem;
   line-height: 1.45;
   padding: 0.9rem;
+  white-space: pre;
+  overflow: auto;
 }
 
 .output-pane { overflow-y: auto; padding-right: 4px; }

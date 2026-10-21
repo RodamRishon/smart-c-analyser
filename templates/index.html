@@ -21,7 +21,10 @@
         <button id="sample-btn" type="button">Load sample</button>
         <button id="analyze-btn" type="button" class="primary">Analyse &amp; Optimise</button>
       </div>
-      <textarea id="source" spellcheck="false">{{ sample }}</textarea>
+      <div class="editor">
+        <pre id="gutter" aria-hidden="true">1</pre>
+        <textarea id="source" spellcheck="false" wrap="off">{{ sample }}</textarea>
+      </div>
     </section>
 
     <section class="output-pane">
