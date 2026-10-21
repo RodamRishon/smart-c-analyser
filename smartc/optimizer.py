@@ -354,8 +354,9 @@ class OptContext:
     whose address is taken)."""
 
     def __init__(self, globals_=(), global_types=None, global_arrays=None,
-                 param_types=None, func_returns=None, pure_functions=None):
+                 param_types=None, func_returns=None, pure_functions=None, pinned=()):
         self.globals = set(globals_)
+        self.pinned = set(pinned)      # variables kept in the output: reads are never replaced by their value
         self.global_types = dict(global_types or {})
         self.global_arrays = dict(global_arrays or {})
         self.param_types = dict(param_types or {})
@@ -713,7 +714,7 @@ def _fold_block(block: List[Instr], state: Dict[str, str], ctx: "OptContext",
                 or _is_unsafe_write(dest):
             return None
         conv = ctx.convert_const(dest, text)
-        if conv is not None:
+        if conv is not None and dest not in ctx.pinned:
             state[dest] = conv
         return conv
 
@@ -1297,7 +1298,7 @@ def eliminate_single_use_variables(instrs: List[Instr], ctx: "OptContext",
             continue
         v, src = d.dest, d.arg1
         if (not isinstance(v, str) or not IDENT_TOKEN_RE.fullmatch(v) or _is_temp(v)
-                or v not in ctx.vars or v in ctx.escaped or v in ctx.arrays
+                or v in ctx.pinned or v not in ctx.vars or v in ctx.escaped or v in ctx.arrays
                 or total_reads.get(v, 0) != 1 or defs.get(v, 0) != 1 or src == v):
             continue
         tv, ts = ctx.type_of(v), ctx.type_of(src)
@@ -2363,7 +2364,8 @@ def optimize(instrs: List[Instr], globals_: Optional[Set[str]] = None, *,
              global_arrays: Optional[Dict[str, Tuple[str, int]]] = None,
              param_types: Optional[Dict[str, str]] = None,
              func_returns: Optional[Dict[str, str]] = None,
-             pure_functions: Optional[Set[str]] = None
+             pure_functions: Optional[Set[str]] = None,
+             pinned: Optional[Set[str]] = None
              ) -> Tuple[List[Instr], OptimizationStats]:
     """Runs the passes to a fixed point. `globals_` names variables that
     outlive the function (other functions may read them), so stores to
@@ -2379,7 +2381,7 @@ def optimize(instrs: List[Instr], globals_: Optional[Set[str]] = None, *,
     globals_ = set(globals_ or ())
     stats = OptimizationStats()
     ctx = OptContext(globals_, global_types, global_arrays, param_types, func_returns,
-                     pure_functions)
+                     pure_functions, pinned or ())
     current = instrs
     stats.converged = False
     # names the *source* reads (an instruction reading its own destination,
@@ -2486,7 +2488,40 @@ def optimize_program(global_instrs: List[Instr], functions
     global_opt, g_stats = optimize(global_instrs, global_names, **kw)
     all_stats = [("<globals>", g_stats)]
     for fn in functions:
-        fn.instructions, stats = optimize(fn.instructions, global_names,
+        original = list(fn.instructions)
+        fn.instructions, stats = optimize(list(original), global_names,
                                           param_types=fn.param_types, **kw)
+        fn.instructions, stats = _keep_one_variable(fn, original, stats, global_names,
+                                                    kw)
         all_stats.append((fn.name, stats))
     return global_opt, all_stats
+
+
+def _keep_one_variable(fn, original, stats, global_names, kw):
+    """When constant folding has removed every integer variable of a function,
+    the output would show bare numbers. Keep the first variable that the
+    program prints or returns, and list the removed ones in a comment (the
+    comment is added by the emitter from `fn.fold_notes`)."""
+    from .fold_notes import (folding_trace, note_lines, first_printed,
+                             mentioned_names)
+    trace = folding_trace(original)
+    if not trace:
+        return fn.instructions, stats
+    still = mentioned_names(fn.instructions)
+    gone = [t for t in trace if t[0] not in still]
+    if not gone:
+        return fn.instructions, stats
+    kept_vars = [t[0] for t in trace if t[0] in still]
+    pin = None
+    if not kept_vars:
+        pin = first_printed(original, [t[0] for t in gone])
+    if pin is not None:
+        again, again_stats = optimize(list(original), global_names, pinned={pin},
+                                      param_types=fn.param_types, **kw)
+        if pin in mentioned_names(again):
+            fn.instructions, stats = again, again_stats
+            still = mentioned_names(again)
+            gone = [t for t in trace if t[0] not in still]
+    kept_entry = next((t for t in trace if t[0] == pin), None) if pin in still else None
+    fn.fold_notes = note_lines(gone, kept_entry)
+    return fn.instructions, stats

@@ -146,6 +146,7 @@ class IRFunction:
     instructions: List[Instr] = field(default_factory=list)
     has_body: bool = True
     param_types: dict = field(default_factory=dict)   # IR param name -> type
+    fold_notes: List[str] = field(default_factory=list)   # comment lines for the emitter
 
 
 class IRGenerator:

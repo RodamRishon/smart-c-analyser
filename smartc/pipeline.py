@@ -7,6 +7,8 @@ instead of printing a report. Used by both the Flask web app and
 (optionally) anything else that wants programmatic access to a run.
 """
 
+import re
+
 from .lexer import Lexer
 from .parser import Parser
 from .semantic import SemanticAnalyzer
@@ -171,7 +173,8 @@ def analyze(source: str) -> dict:
     result["control_flow"] = control_flow_summary(optimised_c)
     result["line_counts"] = {
         "original": len(source.splitlines()),
-        "optimised": len(optimised_c.splitlines()),
+        # the explanatory /* ... */ note is not part of the program's size
+        "optimised": len(re.sub(r"[ \t]*/\*.*?\*/[ \t]*\n", "", optimised_c, flags=re.S).splitlines()),
     }
     result["success"] = True
     return result

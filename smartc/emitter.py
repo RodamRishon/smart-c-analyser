@@ -722,6 +722,10 @@ def emit_program(global_instrs: List[Instr], functions: List[IRFunction],
             out.append(sig + ";")
             continue
         out.append(sig + " {")
+        if getattr(fn, "fold_notes", None):
+            out.append("    /* Constant folding")
+            out.extend(f"       {n}" for n in fn.fold_notes)
+            out.append("    */")
         ctx = OptContext(global_names, global_types, global_arrays, fn.param_types, func_returns)
         ctx.refresh(fn.instructions)
         out.extend(emit_function(fn, ctx, struct_types))

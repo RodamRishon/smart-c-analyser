@@ -253,7 +253,7 @@ class Optimiser(unittest.TestCase):
         return out
 
     def c_section(self, out):
-        return out.split("OPTIMISED C CODE")[1]
+        return strip_notes(out.split("OPTIMISED C CODE")[1])
 
     def test_constant_folding_and_dead_branch(self):
         out = self.emitted("int main(){ int x = 2 + 3; if (0) { x = 9; } return x * 4; }")
@@ -617,12 +617,12 @@ class RegressionSuite(unittest.TestCase):
     # B: constant propagation
     def test_b_constant_propagation(self):
         out = self.differential("int main() { int x = 5; int y = x + 2; return y; }")
-        self.assertIn("return 7;", out.split("OPTIMISED C CODE")[1])
+        self.assertIn("return 7;", strip_notes(out.split("OPTIMISED C CODE")[1]))
 
     # C: dead code elimination
     def test_c_dead_code_elimination(self):
         out = self.differential("int main() { int x = 10; return 0; }")
-        c = out.split("OPTIMISED C CODE")[1]
+        c = strip_notes(out.split("OPTIMISED C CODE")[1])
         self.assertNotIn(" x;", c)
         self.assertIn("return 0;", c)
 
@@ -653,7 +653,7 @@ class RegressionSuite(unittest.TestCase):
             "int bump() { g = g + 1; return g; } "
             "int main() { bump(); bump(); return g; }"
         )
-        c = out.split("OPTIMISED C CODE")[1]
+        c = strip_notes(out.split("OPTIMISED C CODE")[1])
         self.assertIn("bump();", c)
 
     # H: nested if/else, early returns, and the unreachable code after
@@ -684,7 +684,7 @@ class RegressionSuite(unittest.TestCase):
             "}\n"
         )
         out = self.differential(src)
-        c = out.split("OPTIMISED C CODE")[1]
+        c = strip_notes(out.split("OPTIMISED C CODE")[1])
         # `c1 = 2 + 3` is folded, then propagated *across* the if into the
         # final return (cross-block constant propagation), leaving c1 dead
         self.assertIn("return sum + 5;", c)
@@ -719,14 +719,14 @@ class RegressionSuite(unittest.TestCase):
             "int id(int x) { x = x; return x; } "
             "int main() { return id(5); }"
         )
-        self.assertNotIn("x = x;", out.split("OPTIMISED C CODE")[1])
+        self.assertNotIn("x = x;", strip_notes(out.split("OPTIMISED C CODE")[1]))
 
     def test_i_self_assignment_from_copy_propagation(self):
         out = self.differential(
             "int f(int v) { int w = v; v = w; return v; } "
             "int main() { return f(3); }"
         )
-        self.assertNotIn("v = v;", out.split("OPTIMISED C CODE")[1])
+        self.assertNotIn("v = v;", strip_notes(out.split("OPTIMISED C CODE")[1]))
 
     # J: a variable whose only reader is itself inside a loop (plain
     # backward liveness can't see this is dead -- it looks live at
@@ -737,7 +737,7 @@ class RegressionSuite(unittest.TestCase):
             "for (i = 0; i < 10; i++) { unused = unused + i; } "
             "return 0; }"
         )
-        self.assertNotIn("unused", out.split("OPTIMISED C CODE")[1])
+        self.assertNotIn("unused", strip_notes(out.split("OPTIMISED C CODE")[1]))
 
     def test_j_live_and_dead_accumulators_in_same_loop(self):
         out = self.differential(
@@ -745,7 +745,7 @@ class RegressionSuite(unittest.TestCase):
             "for (i = 0; i < 20; i++) { sum = sum + i; dead = dead + i * 2; } "
             "return sum % 1000; }"
         )
-        c = out.split("OPTIMISED C CODE")[1]
+        c = strip_notes(out.split("OPTIMISED C CODE")[1])
         self.assertNotIn("dead", c)
         self.assertIn("sum", c)
 
@@ -771,7 +771,7 @@ class RegressionSuite(unittest.TestCase):
             "int bump() { g = g + 1; return g; } "
             "int main() { int x = bump() + 0; int y = x * 1; return y % 256; }"
         )
-        c = out.split("OPTIMISED C CODE")[1]
+        c = strip_notes(out.split("OPTIMISED C CODE")[1])
         self.assertIn("bump()", c)
 
 
@@ -1064,9 +1064,17 @@ class ConstantFoldingStillWorks(unittest.TestCase):
 from smartc.pipeline import analyze   # noqa: E402
 
 
+def strip_notes(c):
+    """The emitter documents folded-away variables in a /* ... */ comment; the
+    tests that check which variables are *gone from the code* look at the
+    code only."""
+    return re.sub(r"[ \t]*/\*.*?\*/[ \t]*\n", "", c, flags=re.S)
+
+
 def optimised(src):
     res = analyze(src)
     assert res["success"], res
+    res["optimised_c"] = strip_notes(res["optimised_c"])
     return res
 
 
@@ -1453,6 +1461,30 @@ class OptimiserSafetyRegressions(unittest.TestCase):
         self.assertIn("no longer read", notes[3])
         self.assertNotIn("never used", notes[3])
         self.assertIn("never used", notes[6])                 # really unused: still says so
+
+    def test_folded_variables_are_listed_and_one_variable_is_kept(self):
+        src = ('#include <stdio.h>\nint main() {\n    int a = 10;\n    int b = 20;\n'
+               '    int c = a + b;\n    int result = c * a;\n    int duplicate = c * 2;\n'
+               '    printf("Result: %d\\n", result);\n    printf("Duplicate: %d\\n", duplicate);\n'
+               '    return 0;\n}\n')
+        res = analyze(src)
+        c = res["optimised_c"]
+        self.assertIn("c = a + b = 10 + 20 = 30", c)          # how the value was reached
+        self.assertIn("result = c * a = 30 * 10 = 300", c)
+        self.assertIn("int result = 300;", c)                 # one variable survives
+        self.assertIn('printf("Result: %d\\n", result);', c)  # and is the one printed
+        code = strip_notes(c)
+        for gone in ("int a", "int b", "int c", "duplicate"):
+            self.assertNotIn(gone, code)
+        _, orig, opt = run_both(self, src)
+        self.assertEqual(orig, opt)
+        self.assertEqual(res["line_counts"]["optimised"], len(code.splitlines()))
+
+    def test_reassigned_variable_is_not_kept_just_to_have_one(self):
+        src = ('#include <stdio.h>\nint main() {\n    int r = 1;\n    r += 2;\n'
+               '    printf("%d\\n", r);\n    return 0;\n}\n')
+        code = strip_notes(analyze(src)["optimised_c"])
+        self.assertIn('printf("%d\\n", 3);', code)
 
     def test_parameter_pointer_self_assignment_is_kept(self):
         # `*p = *p` for a parameter that may be NULL: removing it would turn a crash into success
